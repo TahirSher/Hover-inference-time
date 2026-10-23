@@ -83,8 +83,55 @@ Commands
   python crux_v10.py export    --run_file <runs/..../crux_test.json>
   python crux_v10.py evaluate  --split test --run_files crux_test.json glide_official_test.json
   python crux_v10.py ablate    --split test
+  python crux_v10.py timing    --backbone qwen2.5-vl-7b --glide_repo /path/to/GliDe
+  python crux_v10.py timing_report
 
 --limit always samples round-robin over games (--no-stratify_limit disables it).
+
+Inference-time study ('timing', 'timing_report')
+------------------------------------------------
+  Question: wall-clock cost per video of CRUX, official GliDe and the vanilla
+  baseline, for every backbone, on ONE fixed set of 100 test videos.
+  * Subset: proportional game-stratified random sample of the test split
+    (seed --seed), written once to v10/timing/subset_test_100.json and re-used
+    verbatim by every method and backbone; its SHA-1 is stored in every result
+    file and timing_report refuses to mix subsets.
+  * Measured quantity: latency from the raw .mp4 to the final report for one
+    video, i.e. preprocessing + every model request + post-processing. One-off
+    set-up (imports, loading the CRUX calibration, starting vLLM) is excluded,
+    as in any latency benchmark. GliDe is the unmodified official pipeline
+    (graph.run_pipeline, imported from --glide_repo with its own defaults);
+    only its HTTP call is wrapped to count requests and tokens.
+  * No caching across runs: the disk caches of v8/v9/v10 are NOT read (they
+    would turn CRUX into a lookup); windows are re-extracted into a scratch
+    directory that is deleted afterwards. Within one video an identical request
+    is answered once (in-memory, cleared per video), which is what a deployed
+    system does; these hits are counted separately.
+  * Design: requests are strictly sequential (one method at a time, one request
+    at a time); untimed warm-up videos from 'dev' precede the timed runs; the
+    method order cycles through all permutations across videos, so every
+    method precedes every other equally often (cancels drift and the vLLM
+    multimodal-processor cache, which GliDe's pixel-identical windows would
+    otherwise hit after CRUX). Start vLLM with identical flags for every
+    backbone, ideally `--no-enable-prefix-caching --mm-processor-cache-gb 0`.
+  * Statistics (per backbone): mean, median, IQR, p90, geometric mean and
+    real-time factor RTF = sum(time) / sum(video duration) with game-cluster
+    bootstrap intervals (bootstrap SE, t(G-1) quantile, G/(G-1) correction).
+    Paired method contrasts on the common videos: ratio of geometric means
+    (log-time differences) and ratio of total time, game-level sign-flip
+    permutation test on log-time differences, Holm correction; the Wilcoxon
+    signed-rank test is reported as a secondary, cluster-naive check.
+  * Resumable: every (video, method) result is written as soon as it exists.
+  Recipe (one GPU: serve one backbone at a time, same vLLM flags each time):
+    for B in qwen2.5-vl-3b qwen2.5-vl-7b internvl2.5-4b internvl2.5-8b ui-tars-1.5-7b:
+      vllm serve <hf id of B> --port 8000 --max-logprobs 20 \\
+           --no-enable-prefix-caching --mm-processor-cache-gb 0 &
+      python crux_v10.py timing --backbone $B --glide_repo /path/to/GliDe
+      (stop the server)
+    python crux_v10.py timing_report
+  Several servers at once: --timing_backbones all --timing_api_map
+  'qwen2.5-vl-3b=http://localhost:8001/v1,...'. CRUX is timed only for
+  backbones that have v10/params/<backbone>/calibration.json.
 
 Fair-comparison recipe (same backbone, same server, same judge, same videos)
   1. vllm serve Qwen/Qwen2.5-VL-7B-Instruct --port 8000 --max-logprobs 20
@@ -112,17 +159,21 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
+import gc
 import hashlib
+import itertools
 import json
 import logging
 import math
 import os
 import random
 import re
+import shutil
 import sys
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -250,6 +301,23 @@ class Config:
     n_permutations: int = 10000
     limit: Optional[int] = None
 
+    # ---- caching (the timing study turns both off) -------------------------------
+    cache_read: bool = True       # read the on-disk VLM cache
+    cache_write: bool = True      # write the on-disk VLM cache
+    windows_dir: str = ""         # overrides <work>/windows (timing uses a scratch dir)
+
+    # ---- inference-time study -------------------------------------------------------
+    timing_split: str = "test"
+    timing_n: int = 100                        # videos, identical for every method/backbone
+    timing_methods: str = "crux,glide,vanilla"
+    timing_backbones: str = ""                 # comma list or 'all'; '' = --backbone only
+    timing_api_map: str = ""                   # 'backbone=http://host:port/v1,...'
+    timing_warmup: int = 2                     # untimed 'dev' videos per method first
+    timing_repeats: int = 1
+    timing_reset_prefix_cache: bool = True     # best effort: POST <server>/reset_prefix_cache
+    timing_retry_failed: bool = False
+    timing_keep_scratch: bool = False
+
     def paths(self) -> Dict[str, str]:
         w = os.path.join(self.root, self.work_subdir)
         b = self.backbone
@@ -257,13 +325,14 @@ class Config:
                 "splits": os.path.join(self.root, self.splits_subdir),
                 "meta": os.path.join(self.root, self.metadata_name),
                 "work": w,
-                "windows": os.path.join(w, "windows"),
+                "windows": self.windows_dir or os.path.join(w, "windows"),
                 "cache": os.path.join(w, "cache", b),
                 "judge_cache": os.path.join(w, "cache", "judge",
                                             re.sub(r"[^A-Za-z0-9_.-]", "_", self.judge_model)),
                 "runs": os.path.join(w, "v10", "runs", b),
                 "params": os.path.join(w, "v10", "params", b),
-                "eval": os.path.join(w, "v10", "eval", b)}
+                "eval": os.path.join(w, "v10", "eval", b),
+                "timing": os.path.join(w, "v10", "timing")}
 
     def with_backbone(self, key: str) -> "Config":
         require(key in BACKBONES, f"unknown backbone {key}; have {sorted(BACKBONES)}")
@@ -847,6 +916,10 @@ class Budget:
     completion_tokens: int = 0
     logprob_truncations: int = 0
     by_stage: Dict[str, int] = field(default_factory=dict)
+    memo_hits: int = 0            # in-video duplicates answered from memory (cache_read off)
+    request_failures: int = 0     # failed HTTP attempts (their retries are in model_seconds)
+    model_seconds: float = 0.0    # wall time inside model requests (client side)
+    stage_seconds: Dict[str, float] = field(default_factory=dict)
 
 
 def _file_sig(path: str) -> str:
@@ -892,8 +965,15 @@ class VLMBase:
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         self.budget = Budget()
+        self._memo: Dict[str, Any] = {}
+
+    def reset_memo(self) -> None:
+        """Forget in-memory answers (called per video by the timing study)."""
+        self._memo.clear()
 
     # ---- caching ---------------------------------------------------------------
+    # cache_read=False: the disk cache is never read and identical requests are
+    # answered from an in-memory memo instead (cleared per video by 'timing').
     def _key(self, kind: str, system: str, user: str, images: Sequence[str],
              extra: Dict) -> str:
         return sha1(json.dumps({"k": kind, "b": self.name, "m": self.cfg.model,
@@ -908,6 +988,27 @@ class VLMBase:
     def _store(self, key: str, value: Any) -> None:
         atomic_write_json(os.path.join(self.cache_dir, key[:2], key + ".json"), {"v": value})
 
+    def _lookup(self, key: str) -> Optional[Any]:
+        if key in self._memo:
+            self.budget.memo_hits += 1
+            return self._memo[key]
+        return self._cached(key) if self.cfg.cache_read else None
+
+    def _remember(self, key: str, value: Any) -> None:
+        if not self.cfg.cache_read:
+            self._memo[key] = value
+        if self.cfg.cache_write:
+            self._store(key, value)
+
+    def _timed(self, stage: str, fn: Callable, *args) -> Any:
+        t0 = time.perf_counter()
+        try:
+            return fn(*args)
+        finally:
+            dt = time.perf_counter() - t0
+            self.budget.model_seconds += dt
+            self.budget.stage_seconds[stage] = self.budget.stage_seconds.get(stage, 0.0) + dt
+
     def _count(self, stage: str, cached: bool) -> None:
         self.budget.calls += 1
         self.budget.by_stage[stage] = self.budget.by_stage.get(stage, 0) + 1
@@ -921,13 +1022,13 @@ class VLMBase:
                  max_tokens: int = 512, stage: str = "other") -> str:
         extra = build_generation_kwargs(self.cfg, max_tokens)
         key = self._key("gen", system, user, images, extra)
-        hit = self._cached(key)
+        hit = self._lookup(key)
         if hit is not None:
             self._count(stage, True)
             return hit
-        out = self._generate(system, user, images, max_tokens)
+        out = self._timed(stage, self._generate, system, user, images, max_tokens)
         self._count(stage, False)
-        self._store(key, out)
+        self._remember(key, out)
         return out
 
     def generate_json(self, system: str, user: str, images: Sequence[str] = (),
@@ -945,14 +1046,14 @@ class VLMBase:
               options: Dict[str, Sequence[str]], stage: str = "other") -> Dict[str, float]:
         extra = {"opts": {k: list(v) for k, v in sorted(options.items())}}
         key = self._key("score", system, user, images, extra)
-        hit = self._cached(key)
+        hit = self._lookup(key)
         if hit is not None:
             self._count(stage, True)
             return hit
-        raw = self._score(system, user, images, options)
+        raw = self._timed(stage, self._score, system, user, images, options)
         out = normalise_option_logprobs(raw)
         self._count(stage, False)
-        self._store(key, out)
+        self._remember(key, out)
         return out
 
     def _generate(self, system, user, images, max_tokens) -> str:
@@ -1007,6 +1108,7 @@ class OpenAIVLM(VLMBase):
                 return r.json()
             except Exception as e:  # pragma: no cover - network
                 last = e
+                self.budget.request_failures += 1
                 # DEBUG: dump the failing payload AND the response body
                 try:
                     import json as _json
@@ -2940,6 +3042,722 @@ def cmd_ablate(cfg: Config, vlm: VLMBase, judge: JudgeBase, splits: Dict[str, Li
 
 
 # =============================================================================
+# Inference-time study (design and statistics: module docstring)
+# =============================================================================
+
+TIMING_METHODS = ("crux", "glide", "vanilla")
+
+
+def _safe_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(s))
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def video_duration_seconds(path: str) -> float:
+    """Container duration = frame count / native fps (the official sampler's definition)."""
+    require(cv2 is not None, f"opencv is required ({_CV2_ERR})")
+    cap = cv2.VideoCapture(path)
+    try:
+        fps, n = cap.get(cv2.CAP_PROP_FPS), cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    finally:
+        cap.release()
+    return float(n / fps) if fps and fps > 0 else 0.0
+
+
+def stratified_sample(recs: Sequence[Record], n: int, seed: int) -> List[Record]:
+    """Game-stratified simple random sample without replacement, proportional
+    allocation n_g = n N_g / N rounded by largest remainders (Cochran 1977, ch. 5).
+    Every game keeps its share of the split, so a few long-video games cannot
+    dominate the sample by chance; all methods are compared on the SAME draw,
+    hence no allocation detail can favour one of them."""
+    pool = sorted(recs, key=lambda r: (r.game, r.vid))
+    if n >= len(pool):
+        return pool
+    by: Dict[str, List[Record]] = defaultdict(list)
+    for r in pool:
+        by[r.game].append(r)
+    games, N = sorted(by), len(pool)
+    rng = np.random.default_rng(seed)
+    quota = {g: n * len(by[g]) / N for g in games}
+    alloc = {g: int(math.floor(quota[g])) for g in games}
+    tie = rng.permutation(len(games))
+    rest = sorted(range(len(games)), key=lambda i: (-(quota[games[i]] - alloc[games[i]]), tie[i]))
+    for i in rest[:n - sum(alloc.values())]:
+        alloc[games[i]] += 1
+    out: List[Record] = []
+    for g in games:
+        if alloc[g]:
+            pick = rng.choice(len(by[g]), size=alloc[g], replace=False)
+            out.extend(by[g][int(i)] for i in sorted(pick))
+    return out
+
+
+def _subset_path(cfg: Config) -> str:
+    return os.path.join(cfg.paths()["timing"], f"subset_{cfg.timing_split}_{cfg.timing_n}.json")
+
+
+def timing_subset(cfg: Config, splits: Dict[str, List[Record]]) -> Tuple[List[Record], Dict]:
+    """The fixed video set of the study. Drawn once, then read back verbatim, so
+    every method and backbone (and every later session) times the same videos."""
+    path = _subset_path(cfg)
+    pool = splits[cfg.timing_split]
+    by_vid = {r.vid: r for r in pool}
+    if os.path.exists(path):
+        man = read_json(path)
+        require(sha1(json.dumps(man["vids"])) == man["sha1"], f"{path} was edited (SHA-1 mismatch)")
+        missing = [v for v in man["vids"] if v not in by_vid]
+        require(not missing, f"{len(missing)} subset videos are no longer in split "
+                             f"'{cfg.timing_split}' (e.g. {missing[:3]}); refusing to time a different set")
+        LOG.info("timing subset: re-using %s (%d videos, seed %s, sha1 %s)", path, len(man["vids"]),
+                 man.get("seed"), man["sha1"][:10])
+        return [by_vid[v] for v in man["vids"]], man
+    recs = stratified_sample(pool, cfg.timing_n, cfg.seed)
+    vids = [r.vid for r in recs]
+    if len(recs) < cfg.timing_n:
+        LOG.warning("split '%s' has only %d usable videos (< %d requested)", cfg.timing_split,
+                    len(recs), cfg.timing_n)
+    man = {"split": cfg.timing_split, "requested_n": cfg.timing_n, "n": len(recs),
+           "n_split": len(pool), "seed": cfg.seed, "created": _now(),
+           "design": "proportional game-stratified simple random sample without replacement",
+           "vids": vids, "sha1": sha1(json.dumps(vids)),
+           "video_names": {r.vid: r.video_name for r in recs},
+           "games": {r.vid: r.game for r in recs},
+           "durations": {r.vid: video_duration_seconds(r.video_path) for r in recs}}
+    atomic_write_json(path, man)
+    LOG.info("timing subset: drew %d of %d '%s' videos over %d games -> %s", len(recs), len(pool),
+             cfg.timing_split, len({r.game for r in recs}), path)
+    return recs, man
+
+
+def _server_root(api_base: str) -> str:
+    return re.sub(r"/v1/?$", "", api_base.rstrip("/"))
+
+
+def server_info(api_base: str, api_key: str = "EMPTY") -> Dict[str, Any]:
+    import requests
+    info: Dict[str, Any] = {"api_base": api_base, "models": None, "version": None}
+    hdr = {"Authorization": f"Bearer {api_key}"} if api_key and api_key != "EMPTY" else {}
+    try:
+        r = requests.get(f"{api_base.rstrip('/')}/models", headers=hdr, timeout=10)
+        r.raise_for_status()
+        info["models"] = [m.get("id") for m in r.json().get("data", [])]
+    except Exception as e:  # pragma: no cover - network
+        info["error"] = f"{type(e).__name__}: {e}"
+    try:
+        r = requests.get(f"{_server_root(api_base)}/version", timeout=5)
+        if r.ok:
+            info["version"] = r.json().get("version")
+    except Exception:  # pragma: no cover - network
+        pass
+    return info
+
+
+def reset_prefix_cache(api_base: str) -> bool:
+    """vLLM exposes POST /reset_prefix_cache (dev mode). Returns False if absent."""
+    import requests
+    try:
+        return requests.post(f"{_server_root(api_base)}/reset_prefix_cache", timeout=30).status_code == 200
+    except Exception:  # pragma: no cover - network
+        return False
+
+
+def environment_info() -> Dict[str, Any]:
+    import platform
+    import subprocess
+    info: Dict[str, Any] = {"python": platform.python_version(), "platform": platform.platform(),
+                            "host": platform.node(), "cpu_count": os.cpu_count(),
+                            "numpy": np.__version__, "opencv": getattr(cv2, "__version__", None)}
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+                              "--format=csv,noheader"], capture_output=True, text=True, timeout=10)
+        info["gpus"] = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+    except Exception:
+        info["gpus"] = None
+    return info
+
+
+class GlideRunner:
+    """The official GliDe pipeline (graph.run_pipeline), imported unmodified from
+    --glide_repo and run with its own defaults (BugAgentConfig()). Two read-only
+    probes are attached: the LangGraph node functions get a stage timer, and
+    LLMClient._request_with_retries (the single HTTP exit of every GliDe model
+    call) a request/token counter. Neither changes any input or output."""
+
+    STAGES = ("preprocess_node", "scanner_node", "analyzer_node", "grounder_node",
+              "summarizer_node")
+    active: Optional["GlideRunner"] = None
+
+    def __init__(self, repo: str):
+        require(bool(repo) and os.path.isdir(repo),
+                "GliDe timing needs --glide_repo <clone of https://github.com/SandyyyZheng/GliDe>")
+        repo = os.path.abspath(repo)
+        for mod in ("config", "graph", "llm", "state", "logger"):
+            f = getattr(sys.modules.get(mod), "__file__", None)
+            require(f is None or os.path.abspath(f).startswith(repo),
+                    f"module '{mod}' is already imported from {f}; it would shadow GliDe's")
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        import importlib
+        self.repo = repo
+        self.graph = importlib.import_module("graph")
+        self.config_mod = importlib.import_module("config")
+        client_cls = importlib.import_module("llm.client").LLMClient
+        try:
+            self.sam3 = bool(getattr(importlib.import_module("analyzer.tools"), "SAM3_AVAILABLE", False))
+        except Exception:
+            self.sam3 = None
+        try:
+            import subprocess
+            self.commit = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True,
+                                         text=True, timeout=10).stdout.strip() or None
+        except Exception:
+            self.commit = None
+        GlideRunner.active = self
+        self.stage = "other"
+        self.stats: Dict[str, Any] = {}
+        self._reset()
+        if not getattr(client_cls, "_crux_probe", False):
+            orig = client_cls._request_with_retries
+
+            def probed(client, endpoint, headers, payload):
+                t0 = time.perf_counter()
+                try:
+                    data = orig(client, endpoint, headers, payload)
+                except Exception:
+                    GlideRunner.active._account(time.perf_counter() - t0, None)
+                    raise
+                GlideRunner.active._account(time.perf_counter() - t0, data)
+                return data
+            client_cls._request_with_retries = probed
+            client_cls._crux_probe = True
+        for name in self.STAGES:
+            fn = getattr(self.graph, name)
+            if not getattr(fn, "_crux_probe", False):
+                setattr(self.graph, name, self._stage_timer(name[:-len("_node")], fn))
+
+    @staticmethod
+    def _stage_timer(stage: str, fn: Callable) -> Callable:
+        def node(state):
+            run = GlideRunner.active
+            run.stage = stage
+            t0 = time.perf_counter()
+            try:
+                return fn(state)
+            finally:
+                run.stats["stage_wall_s"][stage] = (run.stats["stage_wall_s"].get(stage, 0.0)
+                                                    + time.perf_counter() - t0)
+                run.stage = "other"
+        node._crux_probe = True
+        return node
+
+    def _reset(self) -> None:
+        self.stats = {"model_calls": 0, "model_s": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
+                      "request_failures": 0, "stage_calls": {}, "stage_model_s": {},
+                      "stage_wall_s": {}}
+
+    def _account(self, dt: float, data: Optional[Dict]) -> None:
+        s, st = self.stats, self.stage
+        s["model_calls"] += 1
+        s["model_s"] += dt
+        s["stage_calls"][st] = s["stage_calls"].get(st, 0) + 1
+        s["stage_model_s"][st] = s["stage_model_s"].get(st, 0.0) + dt
+        if data is None:
+            s["request_failures"] += 1
+            return
+        u = (data.get("usage") if isinstance(data, dict) else None) or {}
+        s["prompt_tokens"] += int(u.get("prompt_tokens", 0) or 0)
+        s["completion_tokens"] += int(u.get("completion_tokens", 0) or 0)
+
+    def run(self, rec: Record, cfg: Config, scratch: str) -> Dict[str, Any]:
+        gc_ = self.config_mod.BugAgentConfig()          # official defaults throughout
+        gc_.llm.api_key, gc_.llm.api_base, gc_.llm.model = cfg.api_key, cfg.api_base, cfg.model
+        gc_.output_dir = scratch
+        gc_.verbose = False                              # console verbosity only
+        GlideRunner.active = self
+        self._reset()
+        t0 = time.perf_counter()
+        state = self.graph.run_pipeline(video_path=rec.video_path, config_dict=gc_.to_dict(),
+                                        game_name=rec.game, log_dir=os.path.join(scratch, "logs"))
+        wall = time.perf_counter() - t0
+        for h in list(logging.getLogger("bugagent").handlers):
+            h.close()
+        rep = state.get("final_report", {}) or {}
+        s = self.stats
+        return {"wall_s": wall, "preprocess_s": s["stage_wall_s"].get("preprocess", 0.0),
+                "model_s": s["model_s"], "calls": s["model_calls"], "model_calls": s["model_calls"],
+                "memo_hits": 0, "prompt_tokens": s["prompt_tokens"],
+                "completion_tokens": s["completion_tokens"], "request_failures": s["request_failures"],
+                "stage_calls": dict(s["stage_calls"]), "stage_model_s": dict(s["stage_model_s"]),
+                "stage_wall_s": dict(s["stage_wall_s"]), "n_windows": state.get("num_windows"),
+                "n_bugs": len(rep.get("bugs", []) or []),
+                "output": {"bugs": list(rep.get("bugs", []) or []),
+                           "time_nodes": list(rep.get("time_nodes", []) or [])}}
+
+
+def _time_inhouse(method: str, cfg: Config, vlm: VLMBase, rec: Record, scratch: str
+                  ) -> Dict[str, Any]:
+    """CRUX or vanilla on one video, from the raw .mp4: windows are re-extracted
+    into `scratch` (no reuse of prepared windows) and no disk cache is read."""
+    cfg_v = Config(**{**asdict(cfg), "windows_dir": scratch})
+    r = replace(rec, duration=0.0)
+    vlm.reset_memo()
+    b0 = asdict(vlm.budget)
+    t0 = time.perf_counter()
+    wins = prepare_record(r, cfg_v, force=True)
+    t1 = time.perf_counter()
+    out = (run_crux(vlm, r, wins, cfg_v) if method == "crux" else run_vanilla(vlm, r, wins, cfg_v))
+    t2 = time.perf_counter()
+    b1 = asdict(vlm.budget)
+    vlm.reset_memo()
+    d = lambda k: b1[k] - b0[k]
+    dd = lambda k: {s: b1[k][s] - b0[k].get(s, 0) for s in b1[k] if b1[k][s] - b0[k].get(s, 0) > 0}
+    return {"wall_s": t2 - t0, "preprocess_s": t1 - t0, "model_s": d("model_seconds"),
+            "calls": d("calls"), "model_calls": d("model_calls"), "memo_hits": d("memo_hits"),
+            "prompt_tokens": d("prompt_tokens"), "completion_tokens": d("completion_tokens"),
+            "request_failures": d("request_failures"), "stage_calls": dd("by_stage"),
+            "stage_model_s": dd("stage_seconds"), "n_windows": len(wins),
+            "n_bugs": len(out["bugs"]),
+            "output": {"bugs": list(out["bugs"]), "time_nodes": list(out["time_nodes"])}}
+
+
+def _same_output(a: Dict, b: Dict) -> bool:
+    j = lambda o: json.dumps(_jsonable([o.get("bugs", []), o.get("time_nodes", [])]))
+    return j(a) == j(b)
+
+
+def _parse_api_map(txt: str) -> Dict[str, str]:
+    out = {}
+    for part in str(txt).split(","):
+        if part.strip():
+            k, sep, v = part.partition("=")
+            require(bool(sep) and k.strip() in BACKBONES, f"bad --timing_api_map entry '{part}'")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def cmd_timing(cfg: Config, splits: Dict[str, List[Record]],
+               vlm_factory: Optional[Callable[[Config], VLMBase]] = None) -> List[str]:
+    methods = [m.strip() for m in cfg.timing_methods.split(",") if m.strip()]
+    require(methods and all(m in TIMING_METHODS for m in methods),
+            f"--timing_methods must be a comma list from {TIMING_METHODS}")
+    require(cfg.timing_repeats >= 1, "--timing_repeats must be >= 1")
+    keys = ([cfg.backbone] if not cfg.timing_backbones.strip() else
+            list(BACKBONES) if cfg.timing_backbones.strip() == "all" else
+            [k.strip() for k in cfg.timing_backbones.split(",") if k.strip()])
+    require(all(k in BACKBONES for k in keys), f"unknown backbone in {keys}; have {sorted(BACKBONES)}")
+    recs, man = timing_subset(cfg, splits)
+    chosen = set(man["vids"])
+    warm = take_limit([r for r in splits["dev"] if r.vid not in chosen], cfg.timing_warmup, True) \
+        if cfg.timing_warmup > 0 else []
+    api_map, env = _parse_api_map(cfg.timing_api_map), environment_info()
+    return [_timing_backbone(cfg, k, methods, recs, man, warm, api_map, env, vlm_factory)
+            for k in keys]
+
+
+def _timing_backbone(cfg: Config, key: str, methods: List[str], recs: List[Record], man: Dict,
+                     warm: List[Record], api_map: Dict[str, str], env: Dict,
+                     vlm_factory: Optional[Callable[[Config], VLMBase]]) -> str:
+    bcfg = cfg if key == cfg.backbone else cfg.with_backbone(key)
+    bcfg = Config(**{**asdict(bcfg), "api_base": api_map.get(key, bcfg.api_base),
+                     "cache_read": False, "cache_write": False})
+    out_dir = os.path.join(cfg.paths()["timing"], _safe_name(key))
+    path = os.path.join(out_dir, f"timing_{cfg.timing_split}_{cfg.timing_n}.json")
+    scratch_root = os.path.join(cfg.paths()["timing"], "_scratch", _safe_name(key))
+    LOG.info("=== timing | backbone %s | model %s @ %s | methods %s | %d videos x %d repeat(s)",
+             key, bcfg.model, bcfg.api_base, methods, len(recs), cfg.timing_repeats)
+
+    if bcfg.backend == "openai":
+        info = server_info(bcfg.api_base, bcfg.api_key)
+        require(info["models"] is not None, f"no OpenAI-compatible server at {bcfg.api_base} "
+                                            f"({info.get('error')}); start vLLM for {bcfg.model}")
+        require(bcfg.model in info["models"],
+                f"{bcfg.api_base} serves {info['models']}, not {bcfg.model} (backbone {key}); "
+                f"start `vllm serve {bcfg.model}` or pass --timing_api_map {key}=<url>")
+    else:
+        require("glide" not in methods, "GliDe needs an OpenAI-compatible server (--backend openai)")
+        info = {"api_base": None, "backend": bcfg.backend}
+
+    mcfg: Dict[str, Config] = {}
+    skipped: Dict[str, str] = {}
+    for m in methods:
+        if m == "crux":
+            try:
+                mcfg[m] = apply_calibration(bcfg)
+            except RuntimeError as e:
+                skipped[m] = str(e)
+                LOG.error("backbone %s: CRUX skipped -- %s", key, e)
+        else:
+            mcfg[m] = bcfg
+    run_methods = [m for m in methods if m in mcfg]
+    require(run_methods, f"backbone {key}: nothing to time ({skipped})")
+    glide = GlideRunner(cfg.glide_repo) if "glide" in run_methods else None
+    vlm = (vlm_factory or make_vlm)(bcfg)
+
+    def time_one(m: str, r: Record, scratch: str) -> Dict[str, Any]:
+        if m == "glide":
+            return glide.run(r, bcfg, scratch)
+        return _time_inhouse(m, mcfg[m], vlm, r, scratch)
+
+    data = read_json(path) if os.path.exists(path) else None
+    if data is not None:
+        require(data.get("subset_sha1") == man["sha1"],
+                f"{path} was timed on a different video subset; move it away to start over")
+        require(data.get("model") == bcfg.model, f"{path} was timed with {data.get('model')}")
+    entries = list((data or {}).get("entries", []))
+    if cfg.timing_retry_failed:
+        entries = [e for e in entries if e.get("ok")]
+    done = {(e["vid"], e["method"], int(e["repeat"])) for e in entries}
+
+    refs: Dict[str, Dict[str, Dict]] = {}
+    for m in ("crux", "vanilla"):
+        rf = os.path.join(bcfg.paths()["runs"], f"{m}_{cfg.timing_split}.json")
+        if m in run_methods and os.path.exists(rf):
+            refs[m] = {o["video_name"]: o for o in read_json(rf).get("outputs", [])}
+
+    can_reset = bcfg.backend == "openai" and cfg.timing_reset_prefix_cache
+    if can_reset and not reset_prefix_cache(bcfg.api_base):
+        LOG.warning("vLLM /reset_prefix_cache is not available (needs VLLM_SERVER_DEV_MODE=1); "
+                    "start the server with --no-enable-prefix-caching for cold-cache timing")
+        can_reset = False
+
+    meta = {"version": VERSION, "backbone": key, "model": bcfg.model, "api_base": bcfg.api_base,
+            "backend": bcfg.backend, "split": cfg.timing_split, "n": len(recs),
+            "subset_sha1": man["sha1"], "subset_file": _subset_path(cfg), "methods": run_methods,
+            "skipped_methods": skipped, "server": info, "environment": env,
+            "glide": ({"repo": glide.repo, "commit": glide.commit, "sam3_available": glide.sam3}
+                      if glide else None),
+            "crux_calibration": _calib_path(bcfg) if "crux" in run_methods else None,
+            "design": {"repeats": cfg.timing_repeats, "warmup_videos": [r.vid for r in warm],
+                       "order": "cyclic over all method permutations",
+                       "prefix_cache_reset_per_run": can_reset, "disk_cache_read": False,
+                       "in_video_memo": True, "concurrency": 1}}
+
+    def save() -> None:
+        atomic_write_json(path, {**meta, "updated": _now(), "entries": entries})
+
+    pending = [(r.vid, m, k) for k in range(cfg.timing_repeats) for r in recs for m in run_methods
+               if (r.vid, m, k) not in done]
+    LOG.info("backbone %s: %d of %d runs pending (%d already in %s)", key, len(pending),
+             len(recs) * len(run_methods) * cfg.timing_repeats, len(done), path)
+    if not pending:
+        save()
+        return path
+
+    for r in warm:                       # untimed: CUDA graphs, allocator, HTTP, imports
+        for m in run_methods:
+            scratch = os.path.join(scratch_root, f"warmup_{m}_{_safe_name(r.vid)}")
+            shutil.rmtree(scratch, ignore_errors=True)
+            os.makedirs(scratch, exist_ok=True)
+            t0 = time.perf_counter()
+            try:
+                time_one(m, r, scratch)
+                LOG.info("warm-up %s on %s: %.1f s (discarded)", m, r.vid, time.perf_counter() - t0)
+            except Exception as e:
+                LOG.warning("warm-up %s on %s failed: %s", m, r.vid, e)
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
+
+    perms = list(itertools.permutations(run_methods))
+    for k in range(cfg.timing_repeats):
+        for i, r in enumerate(recs):
+            order = perms[(i + k) % len(perms)]
+            line = []
+            for pos, m in enumerate(order):
+                if (r.vid, m, k) in done:
+                    continue
+                if can_reset:
+                    reset_prefix_cache(bcfg.api_base)
+                gc.collect()
+                scratch = os.path.join(scratch_root, f"{m}_{k}_{_safe_name(r.vid)}")
+                shutil.rmtree(scratch, ignore_errors=True)
+                os.makedirs(scratch, exist_ok=True)
+                e: Dict[str, Any] = {"vid": r.vid, "video_name": r.video_name, "game": r.game,
+                                     "duration": float(man["durations"].get(r.vid, 0.0)),
+                                     "method": m, "repeat": k, "position": pos,
+                                     "order": list(order), "started": _now()}
+                try:
+                    e.update(ok=True, **time_one(m, r, scratch))
+                except Exception as ex:
+                    e.update(ok=False, error=f"{type(ex).__name__}: {ex}")
+                    LOG.error("%s on %s failed: %s", m, r.vid, e["error"])
+                finally:
+                    if not cfg.timing_keep_scratch:
+                        shutil.rmtree(scratch, ignore_errors=True)
+                ref = refs.get(m, {}).get(r.video_name)
+                e["agrees_with_reported_run"] = (_same_output(e["output"], ref)
+                                                 if e["ok"] and ref is not None else None)
+                entries.append(e)
+                done.add((r.vid, m, k))
+                save()
+                line.append(f"{m} {e['wall_s']:.1f}s" if e["ok"] else f"{m} FAILED")
+            if line:
+                LOG.info("[%s] %d/%d %s | %s", key, i + 1, len(recs), r.vid, " | ".join(line))
+    if not cfg.timing_keep_scratch:
+        shutil.rmtree(scratch_root, ignore_errors=True)
+        try:
+            os.rmdir(os.path.dirname(scratch_root))      # only if no other backbone uses it
+        except OSError:
+            pass
+    LOG.info("backbone %s: wrote %s", key, path)
+    return path
+
+
+# ---- statistics of the timing study ----------------------------------------------
+
+def _game_units(games: Sequence[str]) -> List[np.ndarray]:
+    gi: Dict[str, List[int]] = defaultdict(list)
+    for i, g in enumerate(games):
+        gi[g].append(i)
+    return [np.asarray(v, int) for _, v in sorted(gi.items())]
+
+
+def _cluster_boot(fn: Callable[[np.ndarray], float], units: List[np.ndarray], B: int,
+                  seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    G = len(units)
+    return np.asarray([fn(np.concatenate([units[u] for u in rng.integers(0, G, G)]))
+                       for _ in range(B)], float)
+
+
+def _t_interval(point: float, boot: np.ndarray, G: int) -> Tuple[float, float]:
+    """Bootstrap-SE interval with a t(G-1) quantile and the G/(G-1) small-sample
+    variance correction (same construction as cluster_bootstrap_auc)."""
+    boot = boot[np.isfinite(boot)]
+    if G < 2 or boot.size < 2 or not math.isfinite(point):
+        return float("nan"), float("nan")
+    from scipy.stats import t as _t
+    se = float(np.std(boot, ddof=1)) * math.sqrt(G / (G - 1.0))
+    q = float(_t.ppf(0.975, G - 1))
+    return point - q * se, point + q * se
+
+
+def cluster_sign_flip(d: np.ndarray, units: List[np.ndarray], B: int, seed: int) -> Dict[str, Any]:
+    """Randomisation test of H0: within every game the two methods' labels are
+    exchangeable, i.e. each game's paired log-time differences are symmetric
+    about 0 as a block. Statistic: mean difference over videos. Exact when
+    2^G <= B, otherwise Monte Carlo with the (1+k)/(1+B) correction."""
+    d = np.asarray(d, float)
+    D = np.array([d[u].sum() for u in units])
+    G, n = len(units), d.size
+    obs = float(D.sum() / n)
+    tol = 1e-12
+    if G <= 20 and 2 ** G <= B:
+        S = np.array(list(itertools.product((1.0, -1.0), repeat=G)))
+        p, exact = float(np.mean(np.abs(S @ D / n) >= abs(obs) - tol)), True
+    else:
+        S = np.random.default_rng(seed).choice((1.0, -1.0), size=(B, G))
+        p, exact = float((1 + np.sum(np.abs(S @ D / n) >= abs(obs) - tol)) / (1 + B)), False
+    return {"mean_log_diff": obs, "p": p, "exact": exact, "n_clusters": G,
+            "min_attainable_p": float(2.0 ** (1 - G)) if G else 1.0}
+
+
+def summarise_times(rows: Sequence[Dict], B: int, seed: int) -> Dict[str, Any]:
+    t = np.array([r["wall_s"] for r in rows], float)
+    dur = np.array([r["duration"] for r in rows], float)
+    units = _game_units([r["game"] for r in rows])
+    G = len(units)
+    lt = np.log(np.maximum(t, 1e-9))
+    mean = float(t.mean())
+    m_lo, m_hi = _t_interval(mean, _cluster_boot(lambda ix: t[ix].mean(), units, B, seed), G)
+    m_lo = max(0.0, m_lo) if math.isfinite(m_lo) else m_lo     # times are positive
+    g_lo, g_hi = _t_interval(float(lt.mean()), _cluster_boot(lambda ix: lt[ix].mean(), units, B,
+                                                             seed + 1), G)
+    has_dur = float(dur.sum()) > 0 and bool(np.all(dur > 0))
+    rtf = float(t.sum() / dur.sum()) if has_dur else float("nan")
+    r_lo, r_hi = (_t_interval(math.log(rtf), _cluster_boot(
+        lambda ix: math.log(t[ix].sum() / dur[ix].sum()), units, B, seed + 2), G)
+        if has_dur else (float("nan"), float("nan")))
+    col = lambda k: np.array([float(r.get(k) or 0.0) for r in rows])
+    stages: Dict[str, List[float]] = defaultdict(list)
+    for r in rows:
+        for s, v in (r.get("stage_model_s") or {}).items():
+            stages[s].append(float(v))
+    return {"n_videos": len(rows), "n_games": G, "mean_s": mean, "mean_ci": [m_lo, m_hi],
+            "sd_s": float(t.std(ddof=1)) if t.size > 1 else float("nan"),
+            "median_s": float(np.median(t)), "q25_s": float(np.percentile(t, 25)),
+            "q75_s": float(np.percentile(t, 75)), "p90_s": float(np.percentile(t, 90)),
+            "min_s": float(t.min()), "max_s": float(t.max()),
+            "geo_mean_s": float(math.exp(lt.mean())), "geo_mean_ci": [math.exp(g_lo), math.exp(g_hi)]
+            if math.isfinite(g_lo) else [float("nan")] * 2,
+            "rtf": rtf, "rtf_ci": [math.exp(r_lo), math.exp(r_hi)] if math.isfinite(r_lo)
+            else [float("nan")] * 2,
+            "total_hours": float(t.sum() / 3600.0), "video_hours": float(dur.sum() / 3600.0),
+            "mean_duration_s": float(dur.mean()),
+            "preprocess_s_mean": float(col("preprocess_s").mean()),
+            "model_s_mean": float(col("model_s").mean()),
+            "model_time_fraction": float(col("model_s").sum() / max(t.sum(), 1e-12)),
+            "requests_mean": float(col("model_calls").mean()),
+            "logical_calls_mean": float(col("calls").mean()),
+            "memo_hits_mean": float(col("memo_hits").mean()),
+            "prompt_tokens_mean": float(col("prompt_tokens").mean()),
+            "completion_tokens_mean": float(col("completion_tokens").mean()),
+            "request_failures_total": int(col("request_failures").sum()),
+            "stage_model_s_mean": {s: float(np.sum(v) / len(rows)) for s, v in sorted(stages.items())}}
+
+
+def paired_time_contrast(a: Dict[str, Dict], b: Dict[str, Dict], cfg: Config) -> Dict[str, Any]:
+    vids = sorted(set(a) & set(b))
+    if len(vids) < 2:
+        return {"n_videos": len(vids)}
+    ta = np.array([a[v]["wall_s"] for v in vids], float)
+    tb = np.array([b[v]["wall_s"] for v in vids], float)
+    d = np.log(np.maximum(ta, 1e-9)) - np.log(np.maximum(tb, 1e-9))
+    units = _game_units([a[v]["game"] for v in vids])
+    G, B = len(units), cfg.n_bootstrap
+    lo, hi = _t_interval(float(d.mean()), _cluster_boot(lambda ix: d[ix].mean(), units, B, cfg.seed), G)
+    tr = float(ta.sum() / tb.sum())
+    t_lo, t_hi = _t_interval(math.log(tr), _cluster_boot(
+        lambda ix: math.log(ta[ix].sum() / tb[ix].sum()), units, B, cfg.seed + 1), G)
+    nz = int(np.sum(np.abs(d) > 1e-12))
+    wil = {"stat": float("nan"), "p": float("nan")}
+    if nz >= 10:
+        st, pw = wilcoxon(d, zero_method="wilcox", alternative="two-sided")
+        wil = {"stat": float(st), "p": float(pw)}
+    return {"n_videos": len(vids), "n_games": G,
+            "geo_mean_ratio": float(math.exp(d.mean())),
+            "geo_mean_ratio_ci": [math.exp(lo), math.exp(hi)] if math.isfinite(lo) else [float("nan")] * 2,
+            "total_time_ratio": tr,
+            "total_time_ratio_ci": [math.exp(t_lo), math.exp(t_hi)] if math.isfinite(t_lo)
+            else [float("nan")] * 2,
+            "fraction_videos_faster": float(np.mean(d < 0)),
+            "permutation_game": cluster_sign_flip(d, units, cfg.n_permutations, cfg.seed),
+            "wilcoxon_cluster_naive": {**wil, "n_nonzero": nz}}
+
+
+def _per_video(entries: Sequence[Dict], method: str) -> Dict[str, Dict]:
+    """Successful runs of one method, averaged over repeats per video."""
+    by: Dict[str, List[Dict]] = defaultdict(list)
+    for e in entries:
+        if e["method"] == method and e.get("ok"):
+            by[e["vid"]].append(e)
+    out = {}
+    for v, es in by.items():
+        row = {"vid": v, "game": es[0]["game"], "duration": es[0]["duration"], "n_repeats": len(es)}
+        for k in ("wall_s", "preprocess_s", "model_s", "calls", "model_calls", "memo_hits",
+                  "prompt_tokens", "completion_tokens", "request_failures"):
+            row[k] = float(np.mean([float(x.get(k) or 0.0) for x in es]))
+        st: Dict[str, float] = defaultdict(float)
+        for x in es:
+            for s, val in (x.get("stage_model_s") or {}).items():
+                st[s] += float(val) / len(es)
+        row["stage_model_s"] = dict(st)
+        out[v] = row
+    return out
+
+
+def cmd_timing_report(cfg: Config) -> Dict[str, Any]:
+    import glob as _glob
+    root = cfg.paths()["timing"]
+    files = [f for f in sorted(_glob.glob(os.path.join(root, "*",
+                                                       f"timing_{cfg.timing_split}_{cfg.timing_n}.json")))
+             if os.sep + "_scratch" + os.sep not in f]
+    require(files, f"no timing results under {root}; run 'timing' first")
+    datas = [read_json(f) for f in files]
+    shas = {d["subset_sha1"] for d in datas}
+    require(len(shas) == 1, f"timing files use different video subsets {shas}; refusing to mix them")
+    order = {k: i for i, k in enumerate(BACKBONES)}
+    datas.sort(key=lambda d: (order.get(d["backbone"], len(order)), d["backbone"]))
+    report: Dict[str, Any] = {"split": cfg.timing_split, "n_subset": datas[0]["n"],
+                              "subset_sha1": shas.pop(), "backbones": {}, "created": _now()}
+    summary_rows, video_rows = [], []
+    for d in datas:
+        bb, entries = d["backbone"], d["entries"]
+        meths = [m for m in TIMING_METHODS if any(e["method"] == m for e in entries)]
+        pv = {m: _per_video(entries, m) for m in meths}
+        common = sorted(set.intersection(*[set(pv[m]) for m in meths])) if meths else []
+        bres: Dict[str, Any] = {"model": d["model"], "server": d.get("server"),
+                                "glide": d.get("glide"), "design": d.get("design"),
+                                "skipped_methods": d.get("skipped_methods", {}),
+                                "n_common_all_methods": len(common), "methods": {},
+                                "comparisons": {}}
+        for m in meths:
+            rows = list(pv[m].values())
+            fails = sorted({e["vid"] for e in entries if e["method"] == m and not e.get("ok")}
+                           - set(pv[m]))
+            agree = [e["agrees_with_reported_run"] for e in entries if e["method"] == m
+                     and e.get("agrees_with_reported_run") is not None]
+            lt_all = [math.log(max(e["wall_s"], 1e-9)) for e in entries if e["method"] == m and e.get("ok")]
+            pos_eff = {}
+            for p in sorted({e["position"] for e in entries if e["method"] == m and e.get("ok")}):
+                lp = [math.log(max(e["wall_s"], 1e-9)) for e in entries
+                      if e["method"] == m and e.get("ok") and e["position"] == p]
+                pos_eff[str(p)] = {"n": len(lp), "time_ratio_vs_method_mean":
+                                   float(math.exp(np.mean(lp) - np.mean(lt_all)))}
+            s = summarise_times(rows, cfg.n_bootstrap, cfg.seed) if rows else {"n_videos": 0}
+            s.update({"n_failed_videos": len(fails), "failed_examples": fails[:5],
+                      "reproduces_reported_outputs": (float(np.mean(agree)) if agree else None),
+                      "n_reproduction_checked": len(agree), "order_position_effect": pos_eff})
+            bres["methods"][m] = s
+            if rows:
+                summary_rows.append({"backbone": bb, "model": d["model"], "method": m, **{
+                    k: s[k] for k in ("n_videos", "n_games", "mean_s", "sd_s", "median_s", "q25_s",
+                                      "q75_s", "p90_s", "geo_mean_s", "rtf", "total_hours",
+                                      "preprocess_s_mean", "model_s_mean", "model_time_fraction",
+                                      "requests_mean", "prompt_tokens_mean",
+                                      "completion_tokens_mean", "request_failures_total")},
+                    "mean_ci_lo": s["mean_ci"][0], "mean_ci_hi": s["mean_ci"][1],
+                    "rtf_ci_lo": s["rtf_ci"][0], "rtf_ci_hi": s["rtf_ci"][1],
+                    "n_failed_videos": len(fails)})
+            for r in rows:
+                video_rows.append({"backbone": bb, "method": m, **{k: r[k] for k in (
+                    "vid", "game", "duration", "n_repeats", "wall_s", "preprocess_s", "model_s",
+                    "model_calls", "prompt_tokens", "completion_tokens")}})
+        pvals = {}
+        for x, y in itertools.combinations(meths, 2):
+            c = paired_time_contrast(pv[x], pv[y], cfg)
+            bres["comparisons"][f"{x} vs {y}"] = c
+            if "permutation_game" in c:
+                pvals[f"{x} vs {y}"] = c["permutation_game"]["p"]
+        bres["holm"] = holm_bonferroni(pvals) if pvals else {}
+        report["backbones"][bb] = bres
+
+    base = os.path.join(root, f"report_{cfg.timing_split}_{cfg.timing_n}")
+    atomic_write_json(base + ".json", report)
+    for suffix, rows in (("_summary.csv", summary_rows), ("_per_video.csv", video_rows)):
+        if rows:
+            with open(base + suffix, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0]))
+                w.writeheader()
+                w.writerows(_jsonable(rows))
+    md = [f"# Inference time per video -- split={cfg.timing_split}, n={report['n_subset']} "
+          f"(subset sha1 {report['subset_sha1'][:10]})", "",
+          "| backbone | method | n | mean s/video [95% CI] | median [IQR] | p90 | RTF [95% CI] "
+          "| requests/video | prompt tok/video | model-time share |",
+          "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in summary_rows:
+        md.append(f"| {r['backbone']} | {r['method']} | {r['n_videos']} | {r['mean_s']:.1f} "
+                  f"[{r['mean_ci_lo']:.1f}, {r['mean_ci_hi']:.1f}] | {r['median_s']:.1f} "
+                  f"[{r['q25_s']:.1f}, {r['q75_s']:.1f}] | {r['p90_s']:.1f} | {r['rtf']:.2f} "
+                  f"[{r['rtf_ci_lo']:.2f}, {r['rtf_ci_hi']:.2f}] | {r['requests_mean']:.1f} | "
+                  f"{r['prompt_tokens_mean']:.0f} | {100 * r['model_time_fraction']:.0f}% |")
+    md += ["", "| backbone | contrast | n | geo-mean time ratio [95% CI] | total time ratio [95% CI] "
+               "| game sign-flip p (Holm) | Wilcoxon p (cluster-naive) |", "|---|---|---|---|---|---|---|"]
+    for bb, bres in report["backbones"].items():
+        for k, c in bres["comparisons"].items():
+            if "permutation_game" not in c:
+                continue
+            pm, h = c["permutation_game"], bres["holm"].get(k, {})
+            md.append(f"| {bb} | {k} | {c['n_videos']} | {c['geo_mean_ratio']:.2f} "
+                      f"[{c['geo_mean_ratio_ci'][0]:.2f}, {c['geo_mean_ratio_ci'][1]:.2f}] | "
+                      f"{c['total_time_ratio']:.2f} [{c['total_time_ratio_ci'][0]:.2f}, "
+                      f"{c['total_time_ratio_ci'][1]:.2f}] | {pm['p']:.4f} "
+                      f"({'reject' if h.get('reject') else 'n.s.'}; G={pm['n_clusters']}) | "
+                      f"{c['wilcoxon_cluster_naive']['p']:.4f} |")
+    md += ["", "Time = wall clock from the raw .mp4 to the final report (preprocessing + all model "
+               "requests + post-processing), sequential requests, no cross-run cache. RTF = total "
+               "processing time / total video duration. Ratios are row method / column method "
+               "(< 1: the first method is faster). CIs: game-cluster bootstrap, t(G-1)."]
+    with open(base + ".md", "w") as f:
+        f.write("\n".join(md) + "\n")
+    print("\n" + "\n".join(md))
+    LOG.info("wrote %s.{json,md} and %s{_summary,_per_video}.csv", base, base)
+    return report
+
+
+# =============================================================================
 # Self-tests: unit tests, parity with the official repository, end-to-end mock
 # =============================================================================
 
@@ -3200,6 +4018,32 @@ def selftest(glide_repo: str = "", verbose: bool = True) -> None:
     chk("permutation: Monte-Carlo branch, null data not rejected", (not pmr["exact"]) and pmr["p"] > 0.05,
         str(pmr))
 
+    # ---- timing study: subset design and paired statistics ---------------------------
+    pool_t = [Record(f"t{i}", f"t{i}", g_, "u", "", False, [], []) for i, g_ in
+              enumerate(["A"] * 50 + ["B"] * 30 + ["C"] * 20)]
+    s1, s2 = stratified_sample(pool_t, 10, 7), stratified_sample(list(reversed(pool_t)), 10, 7)
+    chk("timing subset: deterministic and independent of input order",
+        [r_.vid for r_ in s1] == [r_.vid for r_ in s2])
+    chk("timing subset: proportional allocation 5/3/2 over games",
+        [sum(r_.game == g_ for r_ in s1) for g_ in "ABC"] == [5, 3, 2])
+    chk("timing subset: drawn without replacement", len({r_.vid for r_ in s1}) == 10)
+    u8 = _game_units([f"g{i // 2}" for i in range(16)])
+    sf = cluster_sign_flip(np.full(16, 0.7), u8, 1000, 0)
+    chk("sign-flip: exact, maximal effect reaches min p = 2^(1-G)",
+        sf["exact"] and abs(sf["p"] - 2 ** -7) < 1e-12, str(sf))
+    sf0 = cluster_sign_flip(np.random.default_rng(4).normal(size=400),
+                            _game_units([f"g{i % 40}" for i in range(400)]), 2000, 0)
+    chk("sign-flip: Monte-Carlo branch, null data not rejected", (not sf0["exact"]) and sf0["p"] > 0.05,
+        str(sf0))
+    rng_t = np.random.default_rng(9)
+    tb_ = np.exp(rng_t.normal(3.0, 0.5, 60))
+    a_ = {f"v{i}": {"wall_s": 0.5 * tb_[i], "game": f"g{i % 12}"} for i in range(60)}
+    b_ = {f"v{i}": {"wall_s": tb_[i], "game": f"g{i % 12}"} for i in range(60)}
+    pc_ = paired_time_contrast(a_, b_, Config(n_bootstrap=300, n_permutations=2000))
+    chk("paired contrast: a method twice as fast gives ratio 0.5 with a tight CI",
+        abs(pc_["geo_mean_ratio"] - 0.5) < 1e-9 and abs(pc_["total_time_ratio"] - 0.5) < 1e-9
+        and pc_["fraction_videos_faster"] == 1.0, str(pc_))
+
     # ---- derived images and frame-level likelihood bisection ----------------------
     if cv2 is not None:
         td0 = tempfile.mkdtemp()
@@ -3421,6 +4265,38 @@ def selftest(glide_repo: str = "", verbose: bool = True) -> None:
         except RuntimeError:
             chk("switch mismatch with calibration is refused", True)
 
+        # ---- timing study end to end (CRUX + vanilla; GliDe needs a live server) ---
+        tcfg = Config(**{**asdict(base), "timing_n": 4, "timing_methods": "crux,vanilla",
+                         "timing_warmup": 1, "n_permutations": 2000})
+        fac = lambda c: make_vlm(c, _mock_oracle(label_of, vbias, True,
+                                                 frame_label_of=frame_label_of))
+        tf = cmd_timing(tcfg, spl, fac)[0]
+        td_ = read_json(tf)
+        ent = td_["entries"]
+        chk("timing: every (video, method) of the fixed subset is timed",
+            len(ent) == 8 and all(e_["ok"] for e_ in ent) and {e_["method"] for e_ in ent}
+            == {"crux", "vanilla"}, str([(e_["method"], e_.get("error")) for e_ in ent]))
+        man_ = read_json(_subset_path(tcfg))
+        chk("timing: subset is game-stratified and recorded in every result file",
+            len(set(man_["games"].values())) == 2 and td_["subset_sha1"] == man_["sha1"])
+        chk("timing: method order alternates across videos",
+            {tuple(e_["order"]) for e_ in ent} == {("crux", "vanilla"), ("vanilla", "crux")})
+        chk("timing: no disk cache read, preprocessing timed, scratch removed",
+            all(e_["preprocess_s"] > 0 and e_["calls"] >= e_["model_calls"] > 0 for e_ in ent)
+            and not os.path.exists(os.path.join(tcfg.paths()["timing"], "_scratch", "qwen2.5-vl-7b")))
+        chk("timing: resume adds nothing when complete", len(read_json(cmd_timing(tcfg, spl, fac)[0])
+                                                             ["entries"]) == 8)
+        rep_ = cmd_timing_report(tcfg)
+        cm_ = rep_["backbones"]["qwen2.5-vl-7b"]["comparisons"].get("crux vs vanilla", {})
+        chk("timing report: paired contrast on the 4 common videos",
+            cm_.get("n_videos") == 4 and cm_["geo_mean_ratio"] > 0, str(cm_)[:200])
+        chk("timing report: csv/md written", all(os.path.exists(os.path.join(
+            tcfg.paths()["timing"], f"report_test_4{s_}")) for s_ in (".md", ".json", "_summary.csv",
+                                                                         "_per_video.csv")))
+        other = Config(**{**asdict(tcfg), "seed": tcfg.seed + 1})
+        chk("timing: an existing subset is re-used verbatim, whatever the seed",
+            [r_.vid for r_ in timing_subset(other, spl)[0]] == man_["vids"])
+
     print(f"\n{n[0] - len(fails)}/{n[0]} checks passed")
     if fails:
         for f in fails:
@@ -3433,7 +4309,7 @@ def selftest(glide_repo: str = "", verbose: bool = True) -> None:
 # =============================================================================
 
 COMMANDS = ("selftest", "prepare", "diagnose", "probe", "calibrate", "run", "import_glide",
-            "export", "evaluate", "ablate")
+            "export", "evaluate", "ablate", "timing", "timing_report")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3487,8 +4363,15 @@ def main() -> None:
         require(a.run_file, "--run_file is required")
         cmd_export(a.run_file)
         return
+    if a.command == "timing_report":
+        cmd_timing_report(cfg)
+        return
     recs = load_records(cfg)
     splits = load_splits(cfg, recs)
+    if a.command == "timing":
+        LOG.propagate = False            # GliDe configures its own 'bugagent' loggers
+        cmd_timing(cfg, splits)
+        return
     if a.command == "prepare":
         prepare_split(take_limit(splits[a.split], cfg.limit, cfg.stratify_limit), cfg)
         return
